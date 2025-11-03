@@ -100,7 +100,7 @@ function loadImage(src) {
 }
 async function preloadBrushes() {
   const jobs = [];
-  for (let i = 0; i < TOTAL_BRUSHES; i++) jobs.push(loadImage(`slice${i}.png`));
+  for (let i = 1; i < TOTAL_BRUSHES; i++) jobs.push(loadImage(`slice${i}.png`));
   const images = await Promise.all(jobs);
   brushImgs.splice(0, brushImgs.length, ...images);
 }
