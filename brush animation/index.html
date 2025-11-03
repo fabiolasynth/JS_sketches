@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Canvas Pressure Brush (No p5)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<style>
+  :root { color-scheme: light dark; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #f5f5f5; overflow: hidden; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  #stage {
+    position: fixed; inset: 0;
+    width: 100vw; height: 100vh; display: block;
+    touch-action: none; /* enable Pencil + prevent scroll/zoom */
+    background: #f5f5f5;
+  }
+  .toolbar {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    display: flex; gap: 16px; align-items: center; padding: 8px 12px;
+    background: rgba(0,0,0,0.75); color: #fff; z-index: 10; backdrop-filter: blur(4px);
+    font-size: 12px;
+  }
+  .toolbar label { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .toolbar input[type="range"] { width: 220px; }
+  .spacer { flex: 1; }
+</style>
+</head>
+<body>
+
+<canvas id="stage"></canvas>
+
+<div class="toolbar">
+  <label>Spacing
+    <input id="spacing" type="range" min="0.5" max="30" step="0.1" value="3">
+    <span id="spacingVal">3.0 px</span>
+  </label>
+  <label>Size
+    <input id="size" type="range" min="4" max="200" step="1" value="36">
+    <span id="sizeVal">36 px</span>
+  </label>
+  <label>
+    <input id="rotate" type="checkbox" checked>
+    Align to stroke
+  </label>
+  <div class="spacer"></div>
+  <span>Z = undo, C = clear</span>
+</div>
+
+<script>
+// ---------- Canvas setup (DPR-aware full screen) ----------
+const canvas = document.getElementById('stage');
+const ctx = canvas.getContext('2d', { alpha: false, desynchronized: false });
+function resizeCanvas() {
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  const cssW = window.innerWidth;
+  const cssH = window.innerHeight;
+  canvas.style.width  = cssW + 'px';
+  canvas.style.height = cssH + 'px';
+  canvas.width  = Math.floor(cssW * dpr);
+  canvas.height = Math.floor(cssH * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // “CSS pixels” coordinates
+  redraw();
+}
+window.addEventListener('resize', resizeCanvas);
+
+// ---------- State ----------
+let spacing = 3;
+let brushSize = 36;
+let rotateAlong = true;
+
+const spacingInput = document.getElementById('spacing');
+const sizeInput    = document.getElementById('size');
+const rotateInput  = document.getElementById('rotate');
+const spacingVal   = document.getElementById('spacingVal');
+const sizeVal      = document.getElementById('sizeVal');
+
+spacingInput.addEventListener('input', () => {
+  spacing = parseFloat(spacingInput.value);
+  spacingVal.textContent = `${spacing.toFixed(1)} px`;
+  redraw();
+});
+sizeInput.addEventListener('input', () => {
+  brushSize = parseInt(sizeInput.value, 10);
+  sizeVal.textContent = `${brushSize} px`;
+  redraw();
+});
+rotateInput.addEventListener('change', () => {
+  rotateAlong = rotateInput.checked;
+  redraw();
+});
+
+// Paths: Array of strokes; each stroke is array of points {x,y,p}
+let paths = [];
+let currentPath = null;
+
+// ---------- Image preload ----------
+const brushImgs = [];
+const TOTAL_BRUSHES = 6; // brush0.png ... brush5.png
+
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.decoding = 'async';
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = src;
+  });
+}
+
+async function preloadBrushes() {
+  const promises = [];
+  for (let i = 1; i < TOTAL_BRUSHES; i++) {
+    promises.push(loadImage(`slice${i}.png`));
+  }
+  const images = await Promise.all(promises);
+  brushImgs.splice(0, brushImgs.length, ...images);
+}
+
+// ---------- Pointer handling with pressure ----------
+let isDrawing = false;
+
+canvas.addEventListener('pointerdown', (e) => {
+  const pt = toCanvasCoords(e);
+  if (!inside(pt.x, pt.y)) return;
+  canvas.setPointerCapture(e.pointerId);
+  isDrawing = true;
+  const p = clamp01(e.pressure ?? 0.5);
+  currentPath = [{ x: pt.x, y: pt.y, p }];
+  paths.push(currentPath);
+  e.preventDefault();
+  redraw();
+}, { passive: false });
+
+canvas.addEventListener('pointermove', (e) => {
+  if (!isDrawing || !currentPath) return;
+  const pt = toCanvasCoords(e);
+  if (!inside(pt.x, pt.y)) { e.preventDefault(); return; }
+  const p = clamp01(e.pressure ?? 0.5);
+  addInterpolatedPoint(currentPath, pt.x, pt.y, p, spacing);
+  e.preventDefault();
+  // Draw incrementally for responsiveness
+  drawLastSegment();
+}, { passive: false });
+
+canvas.addEventListener('pointerup', (e) => {
+  if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+  isDrawing = false;
+  currentPath = null;
+  e.preventDefault();
+}, { passive: false });
+
+canvas.addEventListener('pointercancel', (e) => {
+  if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+  isDrawing = false;
+  currentPath = null;
+  e.preventDefault();
+}, { passive: false });
+
+// Map DOM coords to CSS-pixel canvas coords (we already setTransform for DPR)
+function toCanvasCoords(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+function inside(x, y) { return x >= 0 && x < canvas.clientWidth && y >= 0 && y < canvas.clientHeight; }
+function clamp01(v)   { return v < 0 ? 0 : v > 1 ? 1 : v; }
+
+// ---------- Resampling (linear interpolation with pressure lerp) ----------
+function addInterpolatedPoint(path, x, y, p, spacingPx) {
+  const last = path[path.length - 1];
+  const dx = x - last.x, dy = y - last.y;
+  const d  = Math.hypot(dx, dy);
+  if (d < spacingPx) return;
+
+  const steps = Math.floor(d / spacingPx);
+  for (let i = 1; i <= steps; i++) {
+    const t = (i * spacingPx) / d; // 0..1 along segment
+    path.push({ x: last.x + dx * t, y: last.y + dy * t, p: last.p + (p - last.p) * t });
+  }
+  path.push({ x, y, p });
+}
+
+// ---------- Rendering ----------
+function redraw() {
+  // Clear
+  ctx.fillStyle = '#f5f5f5';
+  ctx.fillRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+
+  // Draw all paths
+  for (const path of paths) {
+    drawPath(path);
+  }
+}
+
+// Draw only the last added segment for responsiveness during move
+function drawLastSegment() {
+  const path = paths[paths.length - 1];
+  if (!path || path.length < 2) return;
+  // Draw only the last point (and optionally a couple before)
+  const start = Math.max(1, path.length - 8);
+  for (let i = start; i < path.length; i++) {
+    drawStamp(path, i);
+  }
+}
+
+function drawPath(path) {
+  for (let i = 0; i < path.length; i++) {
+    drawStamp(path, i);
+  }
+}
+
+function drawStamp(path, i) {
+  const pt = path[i];
+  const prev = i > 0 ? path[i - 1] : null;
+
+  // Pressure -> brush index (equal bins)
+  const n = brushImgs.length;
+  if (!n) return;
+  const idx = Math.min(Math.floor(pt.p * n), n - 1);
+  const img = brushImgs[idx];
+
+  // Scale: preserve aspect, longest side == brushSize
+  const iw = img.naturalWidth || img.width;
+  const ih = img.naturalHeight || img.height;
+  const scale = brushSize / Math.max(iw, ih);
+  const w = iw * scale;
+  const h = ih * scale;
+
+  // Angle from previous direction
+  let ang = 0;
+  if (rotateAlong && prev) ang = Math.atan2(pt.y - prev.y, pt.x - prev.x);
+
+  ctx.save();
+  ctx.translate(pt.x, pt.y);
+  if (ang !== 0) ctx.rotate(ang);
+  // Draw centered
+  ctx.drawImage(img, -w / 2, -h / 2, w, h);
+  ctx.restore();
+}
+
+// ---------- Keyboard: undo/clear ----------
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'z' || e.key === 'Z') {
+    if (paths.length) paths.pop();
+    currentPath = null;
+    redraw();
+  } else if (e.key === 'c' || e.key === 'C') {
+    paths = [];
+    currentPath = null;
+    redraw();
+  }
+});
+
+// ---------- Init ----------
+(async function init() {
+  await preloadBrushes();   // load brush0.png ... brush5.png
+  resizeCanvas();           // sets DPR + draws
+  // Initialize UI labels
+  spacingVal.textContent = `${spacing.toFixed(1)} px`;
+  sizeVal.textContent    = `${brushSize} px`;
+})();
+</script>
+</body>
+</html>
