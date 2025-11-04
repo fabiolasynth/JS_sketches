@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<title>Canvas — Pressure-mapped Brushes (Cursor Matches)</title>
+<title>Canvas — Pressure-mapped Brushes (Cursor Matches + Rotation)</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   :root { color-scheme: light dark; }
@@ -14,7 +14,7 @@
   }
   #wrap { position:relative; flex:1 1 auto; }
   #wrap > canvas { position:absolute; inset:0; display:block; }
-  #overlay { cursor:none; touch-action:none; }
+  #overlay { cursor:none; touch-action:none; } /* prevents Apple Pencil scroll */
 
   #controls {
     display:flex; align-items:center; gap:1rem;
@@ -78,7 +78,6 @@ const brushSources = [
   'brush9.png',
   'brush10.png',
   'brush11.png',
-  // add more if you have them: 'brush3.png', 'brush4.png', ...
 ];
 const brushes = [];
 let brushesReady = false;
@@ -95,7 +94,7 @@ function loadBrushes(srcs) {
         brushesReady = true;
         statusEl.textContent = `Brushes ready (${total})`;
         resizeCanvases(false);
-        drawCursor(lastEventBrush); // show cursor ASAP
+        drawCursor(lastEventBrush, lastAngle); // show cursor ASAP
       }
     };
     img.onerror = () => { statusEl.textContent = `Failed to load: ${src}`; };
@@ -108,7 +107,6 @@ loadBrushes(brushSources);
 /* ========= Pressure smoothing & mapping ========= */
 let curPressure = 0.5;           // smoothed pressure we use
 const PRESSURE_SMOOTH = 0.35;    // 0..1 (higher = snappier)
-
 function lerp(a,b,t){ return a + (b-a)*t; }
 
 function pressureToIndex(p) {
@@ -147,24 +145,34 @@ function resizeCanvases(preserve = true) {
   octx.clearRect(0,0,overlay.clientWidth, overlay.clientHeight);
 }
 
-/* ========= Paint & cursor ========= */
+/* ========= Paint & cursor (with rotation) ========= */
 let isDrawing = false;
 let cursorX = null, cursorY = null;
+let lastCursorX = null, lastCursorY = null;
 let lastStampX = null, lastStampY = null;
+// angle in radians; default 0 until we have motion
+let lastAngle = 0;
 
 // The brush chosen for the *last* pointer event (so cursor == paint)
 let lastEventBrush = null;
 
-function stampImage(ctx, img, x, y, size) {
+/** Draw an image centered at (x,y) with rotation (radians). */
+function stampImage(ctx, img, x, y, size, angleRad = 0) {
   if (!img || !img.complete || img.naturalWidth === 0) return;
-  ctx.drawImage(img, x - size/2, y - size/2, size, size);
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(angleRad);
+  ctx.drawImage(img, -size/2, -size/2, size, size);
+  ctx.restore();
 }
 
+/** Stamp along to (x,y) with evenly spaced stamps, rotated to path direction. */
 function stampAlongWithImage(img, x, y) {
   if (!brushesReady || !img) return;
 
   if (lastStampX == null || lastStampY == null) {
-    stampImage(pctx, img, x, y, BRUSH_SIZE);
+    // First stamp of the stroke uses last known heading
+    stampImage(pctx, img, x, y, BRUSH_SIZE, lastAngle);
     lastStampX = x; lastStampY = y;
     return;
   }
@@ -177,23 +185,26 @@ function stampAlongWithImage(img, x, y) {
   const ux = dx / dist;
   const uy = dy / dist;
   const steps = Math.floor(dist / SPACING_PX);
+  // Angle along this segment
+  const segAngle = Math.atan2(uy, ux);
 
   for (let i = 1; i <= steps; i++) {
     const sx = lastStampX + ux * SPACING_PX * i;
     const sy = lastStampY + uy * SPACING_PX * i;
-    // Use the SAME img chosen for this event (keeps cursor == paint)
-    stampImage(pctx, img, sx, sy, BRUSH_SIZE);
+    stampImage(pctx, img, sx, sy, BRUSH_SIZE, segAngle);
   }
 
   lastStampX += ux * SPACING_PX * steps;
   lastStampY += uy * SPACING_PX * steps;
+  lastAngle = segAngle; // keep heading updated
 }
 
-function drawCursor(img) {
+/** Cursor preview uses the current brush and current heading. */
+function drawCursor(img, angleRad = 0) {
   octx.clearRect(0,0,overlay.clientWidth, overlay.clientHeight);
   if (cursorX == null || cursorY == null || !img) return;
   octx.globalAlpha = 0.9;
-  stampImage(octx, img, cursorX, cursorY, BRUSH_SIZE);
+  stampImage(octx, img, cursorX, cursorY, BRUSH_SIZE, angleRad);
   octx.globalAlpha = 1;
 }
 
@@ -203,7 +214,15 @@ function pos(e) { return { x: e.clientX, y: e.clientY, p: e.pressure ?? 0.5 }; }
 overlay.addEventListener('pointerdown', (e) => {
   e.preventDefault();
   const { x, y, p } = pos(e);
+
+  // Update heading from last cursor position if available
+  if (lastCursorX != null && lastCursorY != null) {
+    const dx = x - lastCursorX;
+    const dy = y - lastCursorY;
+    if (dx !== 0 || dy !== 0) lastAngle = Math.atan2(dy, dx);
+  }
   cursorX = x; cursorY = y;
+  lastCursorX = x; lastCursorY = y;
 
   // Smooth & choose a brush ONCE for this event
   curPressure = lerp(curPressure, p, PRESSURE_SMOOTH);
@@ -212,30 +231,42 @@ overlay.addEventListener('pointerdown', (e) => {
   isDrawing = true;
   lastStampX = null; lastStampY = null; // new stroke
   stampAlongWithImage(lastEventBrush, x, y); // force initial stamp
-  drawCursor(lastEventBrush);
+  drawCursor(lastEventBrush, lastAngle);
 });
 
 window.addEventListener('pointermove', (e) => {
   const { x, y, p } = pos(e);
+
+  // Heading from pointer motion
+  if (cursorX != null && cursorY != null) {
+    const dx = x - cursorX;
+    const dy = y - cursorY;
+    if (dx !== 0 || dy !== 0) lastAngle = Math.atan2(dy, dx);
+  }
   cursorX = x; cursorY = y;
+  lastCursorX = x; lastCursorY = y;
 
   // Smooth & choose a brush ONCE for this move event
   curPressure = lerp(curPressure, p, PRESSURE_SMOOTH);
   lastEventBrush = brushes[pressureToIndex(curPressure)] || null;
 
-  drawCursor(lastEventBrush);
+  drawCursor(lastEventBrush, lastAngle);
   if (isDrawing) stampAlongWithImage(lastEventBrush, x, y);
 }, { passive: true });
 
 window.addEventListener('pointerup',   () => { isDrawing = false; lastStampX = lastStampY = null; });
 window.addEventListener('pointercancel', () => { isDrawing = false; lastStampX = lastStampY = null; });
-overlay.addEventListener('pointerleave', () => { cursorX = cursorY = null; drawCursor(lastEventBrush); isDrawing = false; lastStampX = lastStampY = null; });
+overlay.addEventListener('pointerleave', () => {
+  cursorX = cursorY = null;
+  drawCursor(lastEventBrush, lastAngle);
+  isDrawing = false; lastStampX = lastStampY = null;
+});
 
 /* ========= Sliders ========= */
 sizeInput.oninput = () => {
   BRUSH_SIZE = +sizeInput.value;
   sizeVal.textContent = BRUSH_SIZE;
-  drawCursor(lastEventBrush);
+  drawCursor(lastEventBrush, lastAngle);
 };
 spacingInput.oninput = () => {
   SPACING_PX = +spacingInput.value;
@@ -251,7 +282,7 @@ window.addEventListener('keydown', (e) => {
 });
 
 /* ========= Init ========= */
-window.addEventListener('resize', () => { resizeCanvases(true); drawCursor(lastEventBrush); });
+window.addEventListener('resize', () => { resizeCanvases(true); drawCursor(lastEventBrush, lastAngle); });
 resizeCanvases(false);
 </script>
 </body>
