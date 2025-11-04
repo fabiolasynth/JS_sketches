@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Canvas — Pressure-mapped Brushes (Cursor Matches)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root { color-scheme: light dark; }
+  html, body { margin:0; height:100%; }
+  body {
+    display:flex; flex-direction:column;
+    background:#f8f8f8;
+    font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  #wrap { position:relative; flex:1 1 auto; }
+  #wrap > canvas { position:absolute; inset:0; display:block; }
+  #overlay { cursor:none; }
+
+  #controls {
+    display:flex; align-items:center; gap:1rem;
+    padding:10px 14px; border-top:1px solid rgba(0,0,0,.1);
+    background:rgba(250,250,250,.9); backdrop-filter:blur(6px);
+    font-size:14px;
+  }
+  label { opacity:.8; }
+  input[type="range"] { width:160px; }
+  .val { width:36px; text-align:right; font-variant-numeric:tabular-nums; }
+  .muted { opacity:.6; margin-left:auto; }
+</style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="paint"></canvas>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div id="controls">
+    <label>Size</label>
+    <input id="size" type="range" min="8" max="256" step="1" value="64" />
+    <span id="sizeVal" class="val">64</span>
+
+    <label>Spacing</label>
+    <input id="spacing" type="range" min="1" max="200" step="1" value="24" />
+    <span id="spacingVal" class="val">24</span>
+
+    <span id="status" class="muted">Loading brushes…</span>
+  </div>
+
+<script>
+/* ========= Basics / canvases ========= */
+const wrap = document.getElementById('wrap');
+const paint = document.getElementById('paint');
+const overlay = document.getElementById('overlay');
+const pctx = paint.getContext('2d');
+const octx = overlay.getContext('2d');
+
+/* ========= UI ========= */
+const sizeInput = document.getElementById('size');
+const sizeVal   = document.getElementById('sizeVal');
+const spacingInput = document.getElementById('spacing');
+const spacingVal   = document.getElementById('spacingVal');
+const statusEl  = document.getElementById('status');
+
+let BRUSH_SIZE = +sizeInput.value;
+let SPACING_PX = +spacingInput.value;
+
+/* ========= Brushes ========= */
+const brushSources = [
+  'brush0.png',
+  'brush1.png',
+  'brush2.png',
+  'brush3.png',
+  'brush4.png',
+  'brush5.png',
+  // add more if you have them: 'brush3.png', 'brush4.png', ...
+];
+const brushes = [];
+let brushesReady = false;
+
+function loadBrushes(srcs) {
+  let loaded = 0;
+  const total = srcs.length;
+  srcs.forEach((src, i) => {
+    const img = new Image();
+    img.onload = () => {
+      loaded++;
+      statusEl.textContent = `Loaded ${loaded}/${total} brushes`;
+      if (loaded === total) {
+        brushesReady = true;
+        statusEl.textContent = `Brushes ready (${total})`;
+        resizeCanvases(false);
+        drawCursor(lastEventBrush); // show cursor ASAP
+      }
+    };
+    img.onerror = () => { statusEl.textContent = `Failed to load: ${src}`; };
+    img.src = src;
+    brushes[i] = img;
+  });
+}
+loadBrushes(brushSources);
+
+/* ========= Pressure smoothing & mapping ========= */
+let curPressure = 0.5;           // smoothed pressure we use
+const PRESSURE_SMOOTH = 0.35;    // 0..1 (higher = snappier)
+
+function lerp(a,b,t){ return a + (b-a)*t; }
+
+function pressureToIndex(p) {
+  if (!brushes.length) return 0;
+  const n = brushes.length;
+  const clamped = Math.max(0, Math.min(1, p));
+  let idx = Math.floor(clamped * n);
+  if (idx >= n) idx = n - 1; // ensure 1.0 → last index
+  return idx;
+}
+
+/* ========= Hi-DPI resize (preserve paint) ========= */
+function resizeCanvases(preserve = true) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = wrap.clientWidth;
+  const h = wrap.clientHeight;
+
+  let snap = null;
+  if (preserve && paint.width && paint.height) {
+    const off = document.createElement('canvas');
+    off.width = paint.width; off.height = paint.height;
+    off.getContext('2d').drawImage(paint, 0, 0);
+    snap = off;
+  }
+
+  for (const [el, ctx] of [[paint, pctx], [overlay, octx]]) {
+    el.width  = Math.floor(w * dpr);
+    el.height = Math.floor(h * dpr);
+    el.style.width  = w + 'px';
+    el.style.height = h + 'px';
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.scale(dpr, dpr); // 1 unit == 1 CSS px
+  }
+
+  if (snap) pctx.drawImage(snap, 0, 0, snap.width / dpr, snap.height / dpr);
+  octx.clearRect(0,0,overlay.clientWidth, overlay.clientHeight);
+}
+
+/* ========= Paint & cursor ========= */
+let isDrawing = false;
+let cursorX = null, cursorY = null;
+let lastStampX = null, lastStampY = null;
+
+// The brush chosen for the *last* pointer event (so cursor == paint)
+let lastEventBrush = null;
+
+function stampImage(ctx, img, x, y, size) {
+  if (!img || !img.complete || img.naturalWidth === 0) return;
+  ctx.drawImage(img, x - size/2, y - size/2, size, size);
+}
+
+function stampAlongWithImage(img, x, y) {
+  if (!brushesReady || !img) return;
+
+  if (lastStampX == null || lastStampY == null) {
+    stampImage(pctx, img, x, y, BRUSH_SIZE);
+    lastStampX = x; lastStampY = y;
+    return;
+  }
+
+  const dx = x - lastStampX;
+  const dy = y - lastStampY;
+  const dist = Math.hypot(dx, dy);
+  if (dist < SPACING_PX) return;
+
+  const ux = dx / dist;
+  const uy = dy / dist;
+  const steps = Math.floor(dist / SPACING_PX);
+
+  for (let i = 1; i <= steps; i++) {
+    const sx = lastStampX + ux * SPACING_PX * i;
+    const sy = lastStampY + uy * SPACING_PX * i;
+    // Use the SAME img chosen for this event (keeps cursor == paint)
+    stampImage(pctx, img, sx, sy, BRUSH_SIZE);
+  }
+
+  lastStampX += ux * SPACING_PX * steps;
+  lastStampY += uy * SPACING_PX * steps;
+}
+
+function drawCursor(img) {
+  octx.clearRect(0,0,overlay.clientWidth, overlay.clientHeight);
+  if (cursorX == null || cursorY == null || !img) return;
+  octx.globalAlpha = 0.9;
+  stampImage(octx, img, cursorX, cursorY, BRUSH_SIZE);
+  octx.globalAlpha = 1;
+}
+
+/* ========= Pointer events ========= */
+function pos(e) { return { x: e.clientX, y: e.clientY, p: e.pressure ?? 0.5 }; }
+
+overlay.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  const { x, y, p } = pos(e);
+  cursorX = x; cursorY = y;
+
+  // Smooth & choose a brush ONCE for this event
+  curPressure = lerp(curPressure, p, PRESSURE_SMOOTH);
+  lastEventBrush = brushes[pressureToIndex(curPressure)] || null;
+
+  isDrawing = true;
+  lastStampX = null; lastStampY = null; // new stroke
+  stampAlongWithImage(lastEventBrush, x, y); // force initial stamp
+  drawCursor(lastEventBrush);
+});
+
+window.addEventListener('pointermove', (e) => {
+  const { x, y, p } = pos(e);
+  cursorX = x; cursorY = y;
+
+  // Smooth & choose a brush ONCE for this move event
+  curPressure = lerp(curPressure, p, PRESSURE_SMOOTH);
+  lastEventBrush = brushes[pressureToIndex(curPressure)] || null;
+
+  drawCursor(lastEventBrush);
+  if (isDrawing) stampAlongWithImage(lastEventBrush, x, y);
+}, { passive: true });
+
+window.addEventListener('pointerup',   () => { isDrawing = false; lastStampX = lastStampY = null; });
+window.addEventListener('pointercancel', () => { isDrawing = false; lastStampX = lastStampY = null; });
+overlay.addEventListener('pointerleave', () => { cursorX = cursorY = null; drawCursor(lastEventBrush); isDrawing = false; lastStampX = lastStampY = null; });
+
+/* ========= Sliders ========= */
+sizeInput.oninput = () => {
+  BRUSH_SIZE = +sizeInput.value;
+  sizeVal.textContent = BRUSH_SIZE;
+  drawCursor(lastEventBrush);
+};
+spacingInput.oninput = () => {
+  SPACING_PX = +spacingInput.value;
+  spacingVal.textContent = SPACING_PX;
+};
+
+/* ========= Keyboard (optional) ========= */
+window.addEventListener('keydown', (e) => {
+  if (e.key === '[') { sizeInput.value = Math.max(+sizeInput.min, +sizeInput.value - 2); sizeInput.oninput(); }
+  if (e.key === ']') { sizeInput.value = Math.min(+sizeInput.max, +sizeInput.value + 2); sizeInput.oninput(); }
+  if (e.key === '{') { spacingInput.value = Math.max(+spacingInput.min, +spacingInput.value - 2); spacingInput.oninput(); }
+  if (e.key === '}') { spacingInput.value = Math.min(+spacingInput.max, +spacingInput.value + 2); spacingInput.oninput(); }
+});
+
+/* ========= Init ========= */
+window.addEventListener('resize', () => { resizeCanvases(true); drawCursor(lastEventBrush); });
+resizeCanvases(false);
+</script>
+</body>
+</html>
